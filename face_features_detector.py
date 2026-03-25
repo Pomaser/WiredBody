@@ -15,38 +15,50 @@ import ctypes
 import math
 import time
 import winsound
+import numpy as np
 import cv2
 import argparse
 import mediapipe as mp
 
-GLASSES_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glasses.png")
-FUCK_OFF_SOUND   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fuck_off.wav")
+GLASSES_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glasses_single.png")
+JOINT_PATH        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "joint_single.png")
+FUCK_OFF_SOUND    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fuck_off.wav")
 FUCK_OFF_COOLDOWN = 3.0   # sekundy mezi opakovaným přehráním
 
 _last_fuck_off = 0.0
-GLASSES_SCALE    = 0.75   # 1.0 = šířka obličeje, 0.85 = 85 % šířky obličeje
-GLASSES_OFFSET_Y = 25     # kladné = posun dolů (px v původním rozlišení kamery)
-GLASSES_SMOOTH   = 0.25   # EMA alpha: 0 = max plynulost, 1 = bez vyhlazení
+GLASSES_SCALE    = 0.75   # 1.0 = šířka obličeje
+GLASSES_OFFSET_Y = 0
+GLASSES_SMOOTH   = 0.75
 
-# Stav pro EMA vyhlazení brýlí
+JOINT_SCALE      = 0.4    # délka jointu jako násobek šířky obličeje
+JOINT_SMOOTH     = 0.75
+
+# Stav pro EMA vyhlazení
 _g_smooth = {"gx": None, "gy": None, "angle": 0.0}
+_j_smooth = {"jx": None, "jy": None}
 
 def _ema(prev, cur, alpha):
     """Exponenciální klouzavý průměr."""
     return cur if prev is None else alpha * cur + (1.0 - alpha) * prev
 
-def load_glasses():
-    img = cv2.imread(GLASSES_PATH, cv2.IMREAD_UNCHANGED)  # načti i alfa kanál
+def _load_png(path):
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
-        print(f"[WARNING] Cannot load glasses: {GLASSES_PATH}")
+        print(f"[WARNING] Cannot load: {path}")
         return None, None
     if img.shape[2] == 4:
-        mask = img[:, :, 3]          # alfa kanál = maska
-        img  = img[:, :, :3]         # BGR bez alfy
+        mask = img[:, :, 3]
+        img  = img[:, :, :3]
     else:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         _, mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
     return img, mask
+
+def load_glasses():
+    return _load_png(GLASSES_PATH)
+
+def load_joint():
+    return _load_png(JOINT_PATH)
 
 
 def overlay_image(bg, overlay, mask, x, y):
@@ -56,9 +68,10 @@ def overlay_image(bg, overlay, mask, x, y):
     x2, y2 = min(bw, x + ow), min(bh, y + oh)
     if x2 <= x1 or y2 <= y1:
         return
-    ov = overlay[y1 - y:y2 - y, x1 - x:x2 - x]
-    mk = mask[y1 - y:y2 - y, x1 - x:x2 - x]
-    bg[y1:y2, x1:x2][mk > 0] = ov[mk > 0]
+    ov  = overlay[y1 - y:y2 - y, x1 - x:x2 - x].astype(float)
+    a   = mask[y1 - y:y2 - y, x1 - x:x2 - x].astype(float) / 255.0
+    roi = bg[y1:y2, x1:x2].astype(float)
+    bg[y1:y2, x1:x2] = (ov * a[..., np.newaxis] + roi * (1.0 - a[..., np.newaxis])).astype(np.uint8)
 
 
 def get_screen_size():
@@ -153,26 +166,76 @@ def _draw_glasses(frame, mesh_results, glasses_img, glasses_mask):
     g_img  = cv2.resize(glasses_img,  (g_w, g_h))
     g_mask = cv2.resize(glasses_mask, (g_w, g_h))
 
+    # Pivot = bod mezi očima v souřadnicích obrázku brýlí
+    eye_row = int(g_h * 0.35)   # shodné s raw_gy výpočtem výše
+    pivot_x = g_w // 2
+    pivot_y = eye_row
+
     rad = math.radians(abs(angle))
     pad_x = int(g_h * math.sin(rad) / 2) + 1
     pad_y = int(g_w * math.sin(rad) / 2) + 1
     g_img  = cv2.copyMakeBorder(g_img,  pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT, value=0)
     g_mask = cv2.copyMakeBorder(g_mask, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT, value=0)
-    M = cv2.getRotationMatrix2D((g_w // 2 + pad_x, g_h // 2 + pad_y), angle, 1.0)
+    M = cv2.getRotationMatrix2D((pivot_x + pad_x, pivot_y + pad_y), angle, 1.0)
     g_img  = cv2.warpAffine(g_img,  M, (g_w + 2*pad_x, g_h + 2*pad_y))
     g_mask = cv2.warpAffine(g_mask, M, (g_w + 2*pad_x, g_h + 2*pad_y))
 
     overlay_image(frame, g_img, g_mask,
                   int(_g_smooth["gx"]) - pad_x,
-                  int(_g_smooth["gy"]) - pad_y)
+                  int(_g_smooth["gy"]) - pad_y + eye_row - pivot_y)
 
 
-def detect_face_features(frame, face_cc, mouth_cc, mesh_results=None, glasses_img=None, glasses_mask=None, show_text=False):
+def _draw_joint(frame, mesh_results, joint_img, joint_mask):
+    """Overlay joint na střed úst; levý horní roh obrázku = střed úst."""
+    if joint_img is None or joint_mask is None:
+        return
+    if mesh_results is not None and mesh_results.multi_face_landmarks:
+        h, w = frame.shape[:2]
+        lm = mesh_results.multi_face_landmarks[0].landmark
+        # Střed úst: průměr levého (61) a pravého (291) koutku
+        mx = int((lm[61].x + lm[291].x) / 2 * w)
+        my = int((lm[61].y + lm[291].y) / 2 * h)
+        _j_smooth["jx"] = _ema(_j_smooth["jx"], mx, JOINT_SMOOTH)
+        _j_smooth["jy"] = _ema(_j_smooth["jy"], my, JOINT_SMOOTH)
+
+    if _j_smooth["jx"] is None:
+        return
+
+    jx = int(_j_smooth["jx"])
+    jy = int(_j_smooth["jy"])
+    angle = _g_smooth["angle"]  # stejný náklon jako brýle
+
+    # Velikost jointu odvozená od šířky obličeje z brýlí
+    face_w = max(int(_g_smooth.get("gw", 60) / GLASSES_SCALE), 40)
+    j_w = int(face_w * JOINT_SCALE)
+    j_h = int(j_w * joint_img.shape[0] / joint_img.shape[1])
+    j_img  = cv2.resize(joint_img,  (j_w, j_h))
+    j_mask = cv2.resize(joint_mask, (j_w, j_h))
+
+    # Padding proti ořezu rohů při rotaci
+    rad = math.radians(abs(angle))
+    pad_x = int(j_h * math.sin(rad) / 2) + 1
+    pad_y = int(j_w * math.sin(rad) / 2) + 1
+    j_img  = cv2.copyMakeBorder(j_img,  pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT, value=0)
+    j_mask = cv2.copyMakeBorder(j_mask, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT, value=0)
+
+    # Pivot = levý horní roh originálu = (pad_x, pad_y) v paddovaném obrázku
+    M = cv2.getRotationMatrix2D((pad_x, pad_y), angle, 1.0)
+    j_img  = cv2.warpAffine(j_img,  M, (j_w + 2*pad_x, j_h + 2*pad_y))
+    j_mask = cv2.warpAffine(j_mask, M, (j_w + 2*pad_x, j_h + 2*pad_y))
+
+    # Levý horní roh originálu (= pad_x, pad_y v paddovaném) musí být na (jx, jy)
+    overlay_image(frame, j_img, j_mask, jx - pad_x, jy - pad_y)
+
+
+def detect_face_features(frame, face_cc, mouth_cc, mesh_results=None, glasses_img=None, glasses_mask=None,
+                         joint_img=None, joint_mask=None, show_text=False):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
 
-    # Brýle řídí Face Mesh — nezávislé na Haar
+    # Brýle + joint řídí Face Mesh — nezávislé na Haar
     _draw_glasses(frame, mesh_results, glasses_img, glasses_mask)
+    _draw_joint(frame, mesh_results, joint_img, joint_mask)
 
     faces = face_cc.detectMultiScale(
         gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
@@ -298,12 +361,21 @@ def main():
 
     face_cc, mouth_cc = load_cascades()
     glasses_img, glasses_mask = load_glasses()
+    joint_img,   joint_mask   = load_joint()
 
     cam_index = args.camera if args.camera is not None else select_camera()
-    cap = cv2.VideoCapture(cam_index, cv2.CAP_MSMF)
+
+    print(f"Opening camera {cam_index}...")
+    cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(cam_index, cv2.CAP_MSMF)
     if not cap.isOpened():
         print(f"[ERROR] Cannot open camera {cam_index}.")
         sys.exit(1)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     print(f"Camera {cam_index} started. Press Q to quit.")
 
@@ -338,7 +410,7 @@ def main():
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mesh_results = face_mesh_model.process(rgb)
 
-            frame, n_faces = detect_face_features(frame, face_cc, mouth_cc, mesh_results, glasses_img, glasses_mask, show_text)
+            frame, n_faces = detect_face_features(frame, face_cc, mouth_cc, mesh_results, glasses_img, glasses_mask, joint_img, joint_mask, show_text)
             frame, n_hands = detect_hands(frame, hands_model, show_text)
 
             if show_text:
@@ -347,7 +419,14 @@ def main():
                 cv2.putText(frame, "Q = quit  |  O = toggle info", (10, frame.shape[0] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-            display = cv2.resize(frame, (scr_w, scr_h))
+            scale = min(scr_w / frame.shape[1], scr_h / frame.shape[0])
+            new_w = int(frame.shape[1] * scale)
+            new_h = int(frame.shape[0] * scale)
+            resized = cv2.resize(frame, (new_w, new_h))
+            display = np.zeros((scr_h, scr_w, 3), dtype=np.uint8)
+            x0 = (scr_w - new_w) // 2
+            y0 = (scr_h - new_h) // 2
+            display[y0:y0+new_h, x0:x0+new_w] = resized
             cv2.imshow(win, display)
 
             key = cv2.waitKey(1) & 0xFF
