@@ -13,14 +13,28 @@ for _dll_dir in [
 
 import ctypes
 import math
+import time
+import winsound
 import cv2
 import numpy as np
 import argparse
 import mediapipe as mp
 
-GLASSES_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glasses.jpg")
-GLASSES_SCALE   = 0.85   # 1.0 = šířka obličeje, 0.85 = 85 % šířky obličeje
-GLASSES_OFFSET_Y = 10    # kladné = posun dolů (px v původním rozlišení kamery)
+GLASSES_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glasses.jpg")
+FUCK_OFF_SOUND   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fuck_off.wav")
+FUCK_OFF_COOLDOWN = 3.0   # sekundy mezi opakovaným přehráním
+
+_last_fuck_off = 0.0
+GLASSES_SCALE    = 0.85   # 1.0 = šířka obličeje, 0.85 = 85 % šířky obličeje
+GLASSES_OFFSET_Y = 10     # kladné = posun dolů (px v původním rozlišení kamery)
+GLASSES_SMOOTH   = 0.25   # EMA alpha: 0 = max plynulost, 1 = bez vyhlazení
+
+# Stav pro EMA vyhlazení brýlí
+_g_smooth = {"gx": None, "gy": None, "angle": 0.0}
+
+def _ema(prev, cur, alpha):
+    """Exponenciální klouzavý průměr."""
+    return cur if prev is None else alpha * cur + (1.0 - alpha) * prev
 
 def load_glasses():
     img = cv2.imread(GLASSES_PATH)
@@ -125,6 +139,16 @@ def detect_face_features(frame, face_cc, eye_cc, mouth_cc, glasses_img=None, gla
                 cx2 = s[1][0] + s[1][2] // 2
                 cy2 = s[1][1] + s[1][3] // 2
                 angle = -math.degrees(math.atan2(cy2 - cy1, cx2 - cx1))
+
+            # EMA vyhlazení pozice a úhlu
+            eye_top = int(min(e[1] for e in eyes))
+            raw_gx = fx + (fw - g_w) // 2
+            raw_gy = fy + eye_top + GLASSES_OFFSET_Y
+            _g_smooth["gx"]    = _ema(_g_smooth["gx"],    raw_gx, GLASSES_SMOOTH)
+            _g_smooth["gy"]    = _ema(_g_smooth["gy"],    raw_gy, GLASSES_SMOOTH)
+            _g_smooth["angle"] = _ema(_g_smooth["angle"], angle,   GLASSES_SMOOTH)
+            angle = _g_smooth["angle"]
+
             # Expand canvas so corners don't get clipped after rotation
             rad = math.radians(abs(angle))
             pad_x = int(g_h * math.sin(rad) / 2) + 1
@@ -136,9 +160,8 @@ def detect_face_features(frame, face_cc, eye_cc, mouth_cc, glasses_img=None, gla
             g_img  = cv2.warpAffine(g_img,  M, (pw, ph))
             g_mask = cv2.warpAffine(g_mask, M, (pw, ph))
 
-            eye_top = int(min(e[1] for e in eyes))
-            g_x = fx + (fw - g_w) // 2 - pad_x
-            g_y = fy + eye_top + GLASSES_OFFSET_Y - pad_y
+            g_x = int(_g_smooth["gx"]) - pad_x
+            g_y = int(_g_smooth["gy"]) - pad_y
             overlay_image(frame, g_img, g_mask, g_x, g_y)
 
         # Mouth — lower 50 % of face
@@ -188,12 +211,18 @@ def detect_hands(frame, hands_model):
                 frame, hand_lm, mp_hands.HAND_CONNECTIONS, lm_color, CONNECTION_COLOR,
             )
 
-            # Gesture label above wrist
+            # Gesture label + zvuk
             wx = int(lm[0].x * w)
             wy = int(lm[0].y * h)
             if fuck_off:
                 cv2.putText(frame, "FUCK OFF!", (wx - 40, wy + 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                global _last_fuck_off
+                now = time.time()
+                if now - _last_fuck_off >= FUCK_OFF_COOLDOWN:
+                    _last_fuck_off = now
+                    winsound.PlaySound(FUCK_OFF_SOUND,
+                                       winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
 
     return frame, n_hands
 
