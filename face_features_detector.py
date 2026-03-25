@@ -13,6 +13,7 @@ for _dll_dir in [
 
 import ctypes
 import math
+import random
 import time
 import winsound
 import numpy as np
@@ -36,6 +37,59 @@ JOINT_SMOOTH     = 0.75
 # Stav pro EMA vyhlazení
 _g_smooth = {"gx": None, "gy": None, "angle": 0.0}
 _j_smooth = {"jx": None, "jy": None}
+_smoke: list = []
+MAX_SMOKE = 80
+SMOKE_SPAWN = 3   # částice za snímek
+
+
+def _smoke_update_draw(frame, tip_x, tip_y):
+    """Particle kouře u hořícího konce jointu."""
+    h, w = frame.shape[:2]
+
+    # Spawn nových částic
+    for _ in range(SMOKE_SPAWN):
+        if len(_smoke) < MAX_SMOKE:
+            _smoke.append({
+                "x": float(tip_x) + random.gauss(0, 2),
+                "y": float(tip_y) + random.gauss(0, 2),
+                "vx": random.gauss(0, 0.4),
+                "vy": -random.uniform(0.6, 2.0),
+                "size": random.uniform(2, 5),
+                "alpha": random.uniform(0.25, 0.55),
+                "age": 0,
+                "max_age": random.randint(25, 55),
+            })
+
+    # Aktualizace fyziky + kreslení na jediný buffer
+    smoke_buf = np.zeros((h, w), dtype=np.float32)
+    alive = []
+    for p in _smoke:
+        p["age"] += 1
+        if p["age"] >= p["max_age"]:
+            continue
+        p["x"]  += p["vx"]
+        p["y"]  += p["vy"]
+        p["vx"] += random.gauss(0, 0.18)   # turbulence
+        p["size"] += 0.35                   # rozptyl
+        life = 1.0 - p["age"] / p["max_age"]
+        intensity = p["alpha"] * life
+        cx, cy = int(p["x"]), int(p["y"])
+        sz = max(1, int(p["size"]))
+        y1, y2 = max(0, cy - sz), min(h, cy + sz + 1)
+        x1, x2 = max(0, cx - sz), min(w, cx + sz + 1)
+        if y2 > y1 and x2 > x1:
+            cv2.circle(smoke_buf, (cx, cy), sz, float(intensity), -1)
+        alive.append(p)
+    _smoke[:] = alive
+
+    if smoke_buf.max() < 0.01:
+        return
+    smoke_soft = cv2.GaussianBlur(smoke_buf, (31, 31), 0)
+    smoke_soft = np.clip(smoke_soft, 0, 1)[..., np.newaxis]
+    smoke_color = np.array([210, 210, 215], dtype=np.float32)
+    frame[:] = (frame.astype(np.float32) * (1 - smoke_soft * 0.85)
+                + smoke_color * smoke_soft * 0.85).astype(np.uint8)
+
 
 def _ema(prev, cur, alpha):
     """Exponenciální klouzavý průměr."""
@@ -226,6 +280,13 @@ def _draw_joint(frame, mesh_results, joint_img, joint_mask):
 
     # Levý horní roh originálu (= pad_x, pad_y v paddovaném) musí být na (jx, jy)
     overlay_image(frame, j_img, j_mask, jx - pad_x, jy - pad_y)
+
+    # Kouř — hořící konec jointu = pravý dolní roh obrázku rotovaný do světa
+    # OpenCV rot. konvence: x' = cos*x + sin*y,  y' = -sin*x + cos*y
+    a_rad = math.radians(angle)
+    tip_x = int(jx + j_w * math.cos(a_rad) + j_h * math.sin(a_rad))
+    tip_y = int(jy - j_w * math.sin(a_rad) + j_h * math.cos(a_rad))
+    _smoke_update_draw(frame, tip_x, tip_y)
 
 
 def detect_face_features(frame, face_cc, mouth_cc, mesh_results=None, glasses_img=None, glasses_mask=None,
