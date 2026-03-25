@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python face_features_detector.py)",
+      "Bash(where python3:*)",
+      "Bash(where python:*)",
+      "Bash(where py:*)",
+      "Bash(python3 -c \"import cv2; print\\(''cv2 OK'', cv2.__version__\\)\")",
+      "Read(//c/Users/maj9bj/AppData/Local/Programs/**)",
+      "Bash(ls /c/Python*)",
+      "Read(//c/Users/maj9bj/**)",
+      "Bash(/c/Users/maj9bj/.conda/envs/faceenv/python.exe --version)",
+      "Bash(/c/Users/maj9bj/.conda/envs/faceenv/python.exe -c \"import cv2; print\\(''cv2'', cv2.__version__\\)\")",
+      "Bash(/c/Users/maj9bj/.conda/envs/faceenv/python.exe -c \"import cv2; print\\(cv2.__version__\\)\")",
+      "Bash(/c/Users/maj9bj/.conda/envs/faceenv/python.exe -m pip uninstall opencv-python opencv-python-headless -y)",
+      "Bash(\"/c/Program Files/Anaconda3/_conda.exe\" run -n faceenv python -c \"import cv2; print\\(cv2.__version__\\)\")",
+      "Bash(\"/c/Program Files/Anaconda3/python.exe\" --version)",
+      "Bash(\"/c/Program Files/Anaconda3/python.exe\" -c \"import cv2; print\\(cv2.__version__\\)\")"
+    ]
+  }
+}

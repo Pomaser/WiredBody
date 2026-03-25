@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/c/Users/maj9bj/.conda/envs/faceenv/python.exe -m pip install \"mediapipe==0.9.1\" --quiet)",
+      "Bash(/c/Users/maj9bj/.conda/envs/faceenv/python.exe -m pip install \"mediapipe==0.10.14\" --quiet)",
+      "Bash(/c/Users/maj9bj/.conda/envs/faceenv/python.exe -c \":*)",
+      "Bash(/c/Users/maj9bj/.conda/envs/faceenv/python.exe face_features_detector.py --camera 0)",
+      "Bash(/c/Users/maj9bj/.conda/envs/faceenv/python.exe -m pip install --force-reinstall Pillow)",
+      "Bash(/c/Users/maj9bj/.conda/envs/faceenv/python.exe -m pip --version)",
+      "Bash(\"/c/Program Files/Anaconda3/python.exe\" -c \"import mediapipe; print\\(''mediapipe OK'', mediapipe.__version__\\)\")",
+      "Bash(\"/c/Program Files/Anaconda3/python.exe\" -m pip install mediapipe)",
+      "Bash(\"/c/Program Files/Anaconda3/python.exe\" -m pip install mediapipe --no-cache-dir)",
+      "Bash(\"/c/Program Files/Anaconda3/python.exe\" -m pip list)",
+      "Bash(\"/c/Program Files/Anaconda3/Scripts/pip.exe\" list)",
+      "Read(//c/Program Files/Anaconda3/**)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(py --version)"
+    ]
+  }
+}
