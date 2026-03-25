@@ -16,11 +16,10 @@ import math
 import time
 import winsound
 import cv2
-import numpy as np
 import argparse
 import mediapipe as mp
 
-GLASSES_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glasses.jpg")
+GLASSES_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glasses.png")
 FUCK_OFF_SOUND   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fuck_off.wav")
 FUCK_OFF_COOLDOWN = 3.0   # sekundy mezi opakovaným přehráním
 
@@ -37,14 +36,16 @@ def _ema(prev, cur, alpha):
     return cur if prev is None else alpha * cur + (1.0 - alpha) * prev
 
 def load_glasses():
-    img = cv2.imread(GLASSES_PATH)
+    img = cv2.imread(GLASSES_PATH, cv2.IMREAD_UNCHANGED)  # načti i alfa kanál
     if img is None:
         print(f"[WARNING] Cannot load glasses: {GLASSES_PATH}")
         return None, None
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    if img.shape[2] == 4:
+        mask = img[:, :, 3]          # alfa kanál = maska
+        img  = img[:, :, :3]         # BGR bez alfy
+    else:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
     return img, mask
 
 
@@ -116,15 +117,12 @@ def detect_face_features(frame, face_cc, eye_cc, mouth_cc, glasses_img=None, gla
         # Eyes — upper 60 % of face
         eye_h = int(fh * 0.60)
         eyes = eye_cc.detectMultiScale(
-            face_gray[:eye_h, :], scaleFactor=1.1, minNeighbors=6, minSize=(20, 20)
+            face_gray[:eye_h, :], scaleFactor=1.1, minNeighbors=4, minSize=(20, 20)
         )
-        #for (ex, ey, ew, eh) in eyes:
-            #cv2.rectangle(face_color, (ex, ey), (ex + ew, ey + eh), (0, 220, 0), 2)
-            #cv2.putText(face_color, "eye", (ex, ey - 4),
-            #            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 0), 1)
 
-        # Glasses overlay
-        if glasses_img is not None and glasses_mask is not None and len(eyes) > 0:
+        # Glasses overlay — zobraz pokud máme obrázek a platnou pozici (i fallback)
+        has_position = len(eyes) > 0 or _g_smooth["gx"] is not None
+        if glasses_img is not None and glasses_mask is not None and has_position:
             g_w = int(fw * GLASSES_SCALE)
             g_h = int(g_w * glasses_img.shape[0] / glasses_img.shape[1])
             g_img = cv2.resize(glasses_img, (g_w, g_h))
@@ -140,13 +138,14 @@ def detect_face_features(frame, face_cc, eye_cc, mouth_cc, glasses_img=None, gla
                 cy2 = s[1][1] + s[1][3] // 2
                 angle = -math.degrees(math.atan2(cy2 - cy1, cx2 - cx1))
 
-            # EMA vyhlazení pozice a úhlu
-            eye_top = int(min(e[1] for e in eyes))
-            raw_gx = fx + (fw - g_w) // 2
-            raw_gy = fy + eye_top + GLASSES_OFFSET_Y
-            _g_smooth["gx"]    = _ema(_g_smooth["gx"],    raw_gx, GLASSES_SMOOTH)
-            _g_smooth["gy"]    = _ema(_g_smooth["gy"],    raw_gy, GLASSES_SMOOTH)
-            _g_smooth["angle"] = _ema(_g_smooth["angle"], angle,   GLASSES_SMOOTH)
+            # EMA vyhlazení — aktualizuj jen když jsou oči detekovány
+            if len(eyes) > 0:
+                eye_top = int(min(e[1] for e in eyes))
+                raw_gx = fx + (fw - g_w) // 2
+                raw_gy = fy + eye_top + GLASSES_OFFSET_Y
+                _g_smooth["gx"]    = _ema(_g_smooth["gx"],    raw_gx, GLASSES_SMOOTH)
+                _g_smooth["gy"]    = _ema(_g_smooth["gy"],    raw_gy, GLASSES_SMOOTH)
+                _g_smooth["angle"] = _ema(_g_smooth["angle"], angle,   GLASSES_SMOOTH)
             angle = _g_smooth["angle"]
 
             # Expand canvas so corners don't get clipped after rotation
@@ -179,17 +178,19 @@ def detect_face_features(frame, face_cc, eye_cc, mouth_cc, glasses_img=None, gla
 
 
 def is_fuck_off(lm):
-    """Return True when only the middle finger is extended."""
+    """Return True when only the middle finger is extended and hand is upright."""
     # Finger extended = tip.y < pip.y  (y roste dolů)
     # index=8/6, middle=12/10, ring=16/14, pinky=20/18
     index_up  = lm[8].y  < lm[6].y
     middle_up = lm[12].y < lm[10].y
     ring_up   = lm[16].y < lm[14].y
     pinky_up  = lm[20].y < lm[18].y
-    return middle_up and not index_up and not ring_up and not pinky_up
+    # Ruka vzpřímená: zápěstí (0) musí být níž než základna prostředníčku (9)
+    hand_upright = lm[0].y > lm[9].y
+    return middle_up and not index_up and not ring_up and not pinky_up and hand_upright
 
 
-def detect_hands(frame, hands_model):
+def detect_hands(frame, hands_model, show_text=False):
     """Detect hand landmarks and draw a wired hand skeleton."""
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands_model.process(rgb)
@@ -212,11 +213,12 @@ def detect_hands(frame, hands_model):
             )
 
             # Gesture label + zvuk
-            wx = int(lm[0].x * w)
-            wy = int(lm[0].y * h)
             if fuck_off:
-                cv2.putText(frame, "FUCK OFF!", (wx - 40, wy + 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                if show_text:
+                    wx = int(lm[0].x * w)
+                    wy = int(lm[0].y * h)
+                    cv2.putText(frame, "FUCK OFF!", (wx - 40, wy + 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
                 global _last_fuck_off
                 now = time.time()
                 if now - _last_fuck_off >= FUCK_OFF_COOLDOWN:
@@ -298,6 +300,8 @@ def main():
         min_tracking_confidence=0.5,
     ) as hands_model:
 
+        show_text = False  # výchozí stav: texty skryté, O = přepnutí
+
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -305,13 +309,13 @@ def main():
                 continue
 
             frame, n_faces = detect_face_features(frame, face_cc, eye_cc, mouth_cc, glasses_img, glasses_mask)
-            frame, n_hands = detect_hands(frame, hands_model)
+            frame, n_hands = detect_hands(frame, hands_model, show_text)
 
-            # HUD
-            cv2.putText(frame, f"Faces: {n_faces}  Hands: {n_hands}", (10, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(frame, "Q = quit", (10, frame.shape[0] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            if show_text:
+                cv2.putText(frame, f"Faces: {n_faces}  Hands: {n_hands}", (10, 28),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.putText(frame, "Q = quit  |  O = toggle info", (10, frame.shape[0] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
             display = cv2.resize(frame, (scr_w, scr_h))
             cv2.imshow(win, display)
@@ -319,6 +323,8 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
+            if key == ord("o"):
+                show_text = not show_text
             if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
                 break
 
