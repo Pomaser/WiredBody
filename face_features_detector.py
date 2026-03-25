@@ -311,7 +311,8 @@ def main():
 
     win = "Face + Wired Hand Detector"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
-    cv2.resizeWindow(win, 1280, 720)
+    cv2.moveWindow(win, 0, 0)
+    cv2.resizeWindow(win, scr_w, scr_h)
 
     with mp_hands.Hands(
         static_image_mode=False,
