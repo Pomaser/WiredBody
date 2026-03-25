@@ -24,8 +24,8 @@ FUCK_OFF_SOUND   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fuc
 FUCK_OFF_COOLDOWN = 3.0   # sekundy mezi opakovaným přehráním
 
 _last_fuck_off = 0.0
-GLASSES_SCALE    = 0.85   # 1.0 = šířka obličeje, 0.85 = 85 % šířky obličeje
-GLASSES_OFFSET_Y = 10     # kladné = posun dolů (px v původním rozlišení kamery)
+GLASSES_SCALE    = 0.75   # 1.0 = šířka obličeje, 0.85 = 85 % šířky obličeje
+GLASSES_OFFSET_Y = 25     # kladné = posun dolů (px v původním rozlišení kamery)
 GLASSES_SMOOTH   = 0.25   # EMA alpha: 0 = max plynulost, 1 = bez vyhlazení
 
 # Stav pro EMA vyhlazení brýlí
@@ -70,15 +70,16 @@ def get_screen_size():
 # Haar cascade classifiers (face, eyes, mouth)
 # ---------------------------------------------------------------------------
 FACE_CASCADE  = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-EYE_CASCADE   = cv2.data.haarcascades + "haarcascade_eye.xml"
 MOUTH_CASCADE = cv2.data.haarcascades + "haarcascade_smile.xml"
 
 # ---------------------------------------------------------------------------
-# MediaPipe Hands
+# MediaPipe
 # ---------------------------------------------------------------------------
-mp_hands    = mp.solutions.hands
-mp_draw     = mp.solutions.drawing_utils
-mp_styles   = mp.solutions.drawing_styles
+mp_hands      = mp.solutions.hands
+mp_face_mesh  = mp.solutions.face_mesh
+mp_draw       = mp.solutions.drawing_utils
+mp_styles     = mp.solutions.drawing_styles
+
 
 # Colours for the wired hand
 LANDMARK_COLOR   = mp_draw.DrawingSpec(color=(0, 255, 180), thickness=2, circle_radius=4)
@@ -87,92 +88,111 @@ CONNECTION_COLOR = mp_draw.DrawingSpec(color=(0, 180, 255), thickness=2)
 
 def load_cascades():
     face_cc  = cv2.CascadeClassifier(FACE_CASCADE)
-    eye_cc   = cv2.CascadeClassifier(EYE_CASCADE)
     mouth_cc = cv2.CascadeClassifier(MOUTH_CASCADE)
 
-    for name, cc in [("face", face_cc), ("eye", eye_cc), ("mouth", mouth_cc)]:
+    for name, cc in [("face", face_cc), ("mouth", mouth_cc)]:
         if cc.empty():
             print(f"[ERROR] Could not load {name} cascade.")
             sys.exit(1)
 
-    return face_cc, eye_cc, mouth_cc
+    return face_cc, mouth_cc
 
 
-def detect_face_features(frame, face_cc, eye_cc, mouth_cc, glasses_img=None, glasses_mask=None):
+def eyes_from_mesh(mesh_results, frame_w, frame_h):
+    """Vrátí ((rx,ry), (lx,ly), eye_dist) nebo None. Funguje nezávisle na Haar."""
+    if not mesh_results or not mesh_results.multi_face_landmarks:
+        return None
+    lm = mesh_results.multi_face_landmarks[0].landmark
+    def pt(idx):
+        return int(lm[idx].x * frame_w), int(lm[idx].y * frame_h)
+    # pravé oko: vnější 33, vnitřní 133  |  levé oko: vnitřní 362, vnější 263
+    rx = (pt(33)[0] + pt(133)[0]) // 2;  ry = (pt(33)[1] + pt(133)[1]) // 2
+    lx = (pt(362)[0] + pt(263)[0]) // 2; ly = (pt(362)[1] + pt(263)[1]) // 2
+    eye_dist = int(math.hypot(lx - rx, ly - ry))
+    return (rx, ry), (lx, ly), eye_dist
+
+
+def _draw_glasses(frame, mesh_results, glasses_img, glasses_mask):
+    """Překryje brýle nad oči čistě z Face Mesh — nezávislé na Haar."""
+    if glasses_img is None or glasses_mask is None:
+        return
+    h_fr, w_fr = frame.shape[:2]
+    eyes = eyes_from_mesh(mesh_results, w_fr, h_fr)
+
+    # Aktualizuj EMA jen když Face Mesh vidí oči
+    if eyes is not None:
+        (rx, ry), (lx, ly), eye_dist = eyes
+        # Šířka brýlí z rozestupu očí (outer–outer vzdálenost * scale)
+        g_w = int(eye_dist * 3.5 * GLASSES_SCALE)
+        g_w = max(g_w, 40)
+        angle = -math.degrees(math.atan2(ly - ry, lx - rx))
+        cx = (rx + lx) // 2
+        cy = (ry + ly) // 2
+        g_h = int(g_w * glasses_img.shape[0] / glasses_img.shape[1])
+        raw_gx = cx - g_w // 2
+        raw_gy = cy - int(g_h * 0.35) + GLASSES_OFFSET_Y   # 35 % výšky = pozice očí v brýlích
+        _g_smooth["gx"]    = _ema(_g_smooth["gx"],    raw_gx, GLASSES_SMOOTH)
+        _g_smooth["gy"]    = _ema(_g_smooth["gy"],    raw_gy, GLASSES_SMOOTH)
+        _g_smooth["angle"] = _ema(_g_smooth["angle"], angle,   GLASSES_SMOOTH)
+
+    # Kresli pokud máme platnou pozici (i fallback z minulých snímků)
+    if _g_smooth["gx"] is None:
+        return
+
+    # Odhadni aktuální g_w z posledního eye_dist nebo z EMA gx
+    if eyes is not None:
+        _, _, eye_dist = eyes
+        g_w = int(eye_dist * 3.5 * GLASSES_SCALE)
+        g_w = max(g_w, 40)
+    else:
+        g_w = int(abs(_g_smooth.get("gw", 80)))
+    _g_smooth["gw"] = g_w
+
+    angle = _g_smooth["angle"]
+    g_h = int(g_w * glasses_img.shape[0] / glasses_img.shape[1])
+    g_img  = cv2.resize(glasses_img,  (g_w, g_h))
+    g_mask = cv2.resize(glasses_mask, (g_w, g_h))
+
+    rad = math.radians(abs(angle))
+    pad_x = int(g_h * math.sin(rad) / 2) + 1
+    pad_y = int(g_w * math.sin(rad) / 2) + 1
+    g_img  = cv2.copyMakeBorder(g_img,  pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT, value=0)
+    g_mask = cv2.copyMakeBorder(g_mask, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT, value=0)
+    M = cv2.getRotationMatrix2D((g_w // 2 + pad_x, g_h // 2 + pad_y), angle, 1.0)
+    g_img  = cv2.warpAffine(g_img,  M, (g_w + 2*pad_x, g_h + 2*pad_y))
+    g_mask = cv2.warpAffine(g_mask, M, (g_w + 2*pad_x, g_h + 2*pad_y))
+
+    overlay_image(frame, g_img, g_mask,
+                  int(_g_smooth["gx"]) - pad_x,
+                  int(_g_smooth["gy"]) - pad_y)
+
+
+def detect_face_features(frame, face_cc, mouth_cc, mesh_results=None, glasses_img=None, glasses_mask=None, show_text=False):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
+
+    # Brýle řídí Face Mesh — nezávislé na Haar
+    _draw_glasses(frame, mesh_results, glasses_img, glasses_mask)
 
     faces = face_cc.detectMultiScale(
         gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
     )
 
     for (fx, fy, fw, fh) in faces:
-        # cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), (255, 100, 0), 2)
-        # cv2.putText(frame, "face", (fx, fy - 6),
-        #            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 0), 2)
-
         face_gray  = gray[fy:fy + fh, fx:fx + fw]
         face_color = frame[fy:fy + fh, fx:fx + fw]
-
-        # Eyes — upper 60 % of face
-        eye_h = int(fh * 0.60)
-        eyes = eye_cc.detectMultiScale(
-            face_gray[:eye_h, :], scaleFactor=1.1, minNeighbors=4, minSize=(20, 20)
-        )
-
-        # Glasses overlay — zobraz pokud máme obrázek a platnou pozici (i fallback)
-        has_position = len(eyes) > 0 or _g_smooth["gx"] is not None
-        if glasses_img is not None and glasses_mask is not None and has_position:
-            g_w = int(fw * GLASSES_SCALE)
-            g_h = int(g_w * glasses_img.shape[0] / glasses_img.shape[1])
-            g_img = cv2.resize(glasses_img, (g_w, g_h))
-            g_mask = cv2.resize(glasses_mask, (g_w, g_h))
-
-            # Rotation from tilt between two eyes
-            angle = 0.0
-            if len(eyes) >= 2:
-                s = sorted(eyes, key=lambda e: e[0])  # left → right
-                cx1 = s[0][0] + s[0][2] // 2
-                cy1 = s[0][1] + s[0][3] // 2
-                cx2 = s[1][0] + s[1][2] // 2
-                cy2 = s[1][1] + s[1][3] // 2
-                angle = -math.degrees(math.atan2(cy2 - cy1, cx2 - cx1))
-
-            # EMA vyhlazení — aktualizuj jen když jsou oči detekovány
-            if len(eyes) > 0:
-                eye_top = int(min(e[1] for e in eyes))
-                raw_gx = fx + (fw - g_w) // 2
-                raw_gy = fy + eye_top + GLASSES_OFFSET_Y
-                _g_smooth["gx"]    = _ema(_g_smooth["gx"],    raw_gx, GLASSES_SMOOTH)
-                _g_smooth["gy"]    = _ema(_g_smooth["gy"],    raw_gy, GLASSES_SMOOTH)
-                _g_smooth["angle"] = _ema(_g_smooth["angle"], angle,   GLASSES_SMOOTH)
-            angle = _g_smooth["angle"]
-
-            # Expand canvas so corners don't get clipped after rotation
-            rad = math.radians(abs(angle))
-            pad_x = int(g_h * math.sin(rad) / 2) + 1
-            pad_y = int(g_w * math.sin(rad) / 2) + 1
-            g_img  = cv2.copyMakeBorder(g_img,  pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT, value=0)
-            g_mask = cv2.copyMakeBorder(g_mask, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT, value=0)
-            pw, ph = g_w + 2 * pad_x, g_h + 2 * pad_y
-            M = cv2.getRotationMatrix2D((pw // 2, ph // 2), angle, 1.0)
-            g_img  = cv2.warpAffine(g_img,  M, (pw, ph))
-            g_mask = cv2.warpAffine(g_mask, M, (pw, ph))
-
-            g_x = int(_g_smooth["gx"]) - pad_x
-            g_y = int(_g_smooth["gy"]) - pad_y
-            overlay_image(frame, g_img, g_mask, g_x, g_y)
 
         # Mouth — lower 50 % of face
         mouth_y0 = int(fh * 0.50)
         mouths = mouth_cc.detectMultiScale(
             face_gray[mouth_y0:, :], scaleFactor=1.5, minNeighbors=20, minSize=(30, 15)
         )
-        for (mx, my, mw, mh) in mouths:
-            my_abs = my + mouth_y0
-            cv2.rectangle(face_color, (mx, my_abs), (mx + mw, my_abs + mh), (0, 60, 255), 2)
-            cv2.putText(face_color, "mouth", (mx, my_abs - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 60, 255), 1)
+        if show_text:
+            for (mx, my, mw, mh) in mouths:
+                my_abs = my + mouth_y0
+                cv2.rectangle(face_color, (mx, my_abs), (mx + mw, my_abs + mh), (0, 60, 255), 2)
+                cv2.putText(face_color, "mouth", (mx, my_abs - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 60, 255), 1)
 
     return frame, len(faces)
 
@@ -276,7 +296,7 @@ def main():
         print(f"Available cameras: {cams}")
         sys.exit(0)
 
-    face_cc, eye_cc, mouth_cc = load_cascades()
+    face_cc, mouth_cc = load_cascades()
     glasses_img, glasses_mask = load_glasses()
 
     cam_index = args.camera if args.camera is not None else select_camera()
@@ -298,7 +318,13 @@ def main():
         max_num_hands=2,
         min_detection_confidence=0.6,
         min_tracking_confidence=0.5,
-    ) as hands_model:
+    ) as hands_model, mp_face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=1,
+        refine_landmarks=False,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    ) as face_mesh_model:
 
         show_text = False  # výchozí stav: texty skryté, O = přepnutí
 
@@ -308,7 +334,10 @@ def main():
                 print("[WARNING] Empty frame, skipping.")
                 continue
 
-            frame, n_faces = detect_face_features(frame, face_cc, eye_cc, mouth_cc, glasses_img, glasses_mask)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mesh_results = face_mesh_model.process(rgb)
+
+            frame, n_faces = detect_face_features(frame, face_cc, mouth_cc, mesh_results, glasses_img, glasses_mask, show_text)
             frame, n_hands = detect_hands(frame, hands_model, show_text)
 
             if show_text:
