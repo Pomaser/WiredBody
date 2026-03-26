@@ -1,6 +1,13 @@
 import os
 import sys
 
+
+def resource_path(rel: str) -> str:
+    """Vrátí absolutní cestu k souboru — funguje jak při vývoji, tak v PyInstaller .exe."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
+
 # Add conda env DLL directories to PATH so libs load even without activation
 _env_root = os.path.dirname(sys.executable)
 for _dll_dir in [
@@ -12,18 +19,21 @@ for _dll_dir in [
         os.environ["PATH"] = _dll_dir + os.pathsep + os.environ["PATH"]
 
 import ctypes
+import json
+import logging
 import math
 import random
 import time
+import traceback
 import winsound
 import numpy as np
 import cv2
 import argparse
 import mediapipe as mp
 
-GLASSES_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glasses_single.png")
-JOINT_PATH        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "joint_single.png")
-FUCK_OFF_SOUND    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fuck_off.wav")
+GLASSES_PATH      = resource_path("glasses_single.png")
+JOINT_PATH        = resource_path("joint_single.png")
+FUCK_OFF_SOUND    = resource_path("fuck_off.wav")
 FUCK_OFF_COOLDOWN = 3.0   # sekundy mezi opakovaným přehráním
 
 _last_fuck_off = 0.0
@@ -136,8 +146,15 @@ def get_screen_size():
 # ---------------------------------------------------------------------------
 # Haar cascade classifiers (face, eyes, mouth)
 # ---------------------------------------------------------------------------
-FACE_CASCADE  = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-MOUTH_CASCADE = cv2.data.haarcascades + "haarcascade_smile.xml"
+def _cascade_path(filename: str) -> str:
+    """Vrátí cestu ke cascade XML — z bundlu (exe) nebo z cv2.data (dev)."""
+    bundled = resource_path(filename)
+    if os.path.exists(bundled):
+        return bundled
+    return cv2.data.haarcascades + filename
+
+FACE_CASCADE  = _cascade_path("haarcascade_frontalface_default.xml")
+MOUTH_CASCADE = _cascade_path("haarcascade_smile.xml")
 
 # ---------------------------------------------------------------------------
 # MediaPipe
@@ -289,8 +306,12 @@ def _draw_joint(frame, mesh_results, joint_img, joint_mask):
     _smoke_update_draw(frame, tip_x, tip_y)
 
 
+_cached_faces = []
+
+
 def detect_face_features(frame, face_cc, mouth_cc, mesh_results=None, glasses_img=None, glasses_mask=None,
-                         joint_img=None, joint_mask=None, show_text=False):
+                         joint_img=None, joint_mask=None, show_text=False, run_haar=True):
+    global _cached_faces
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
 
@@ -298,9 +319,12 @@ def detect_face_features(frame, face_cc, mouth_cc, mesh_results=None, glasses_im
     _draw_glasses(frame, mesh_results, glasses_img, glasses_mask)
     _draw_joint(frame, mesh_results, joint_img, joint_mask)
 
-    faces = face_cc.detectMultiScale(
-        gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
-    )
+    if run_haar:
+        detected = face_cc.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
+        )
+        _cached_faces = detected if len(detected) else []
+    faces = _cached_faces
 
     for (fx, fy, fw, fh) in faces:
         face_gray  = gray[fy:fy + fh, fx:fx + fw]
@@ -373,6 +397,19 @@ def detect_hands(frame, hands_model, show_text=False):
     return frame, n_hands
 
 
+def load_config() -> dict:
+    # 1) vedle .exe / vedle .py — uživatel může editovat
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    external = os.path.join(exe_dir, "config.json")
+    # 2) uvnitř bundlu — výchozí hodnoty
+    bundled = resource_path("config.json")
+    path = external if os.path.exists(external) else bundled
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {}
+
+
 def find_cameras(max_index=5):
     available = []
     for i in range(max_index):
@@ -424,7 +461,26 @@ def main():
     glasses_img, glasses_mask = load_glasses()
     joint_img,   joint_mask   = load_joint()
 
-    cam_index = args.camera if args.camera is not None else select_camera()
+    if args.camera is not None:
+        cam_index = args.camera
+    else:
+        cfg = load_config()
+        cam_cfg = cfg.get("camera", {})
+        preferred = cam_cfg.get("preferred", None)
+        fallback = cam_cfg.get("fallback", [])
+        available = find_cameras()
+        if preferred is not None and preferred in available:
+            cam_index = preferred
+        else:
+            if preferred is not None:
+                print(f"[WARN] Preferred camera {preferred} not found.")
+            for fb in fallback:
+                if fb in available:
+                    cam_index = fb
+                    print(f"Using fallback camera {fb}.")
+                    break
+            else:
+                cam_index = select_camera()
 
     print(f"Opening camera {cam_index}...")
     cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
@@ -446,6 +502,10 @@ def main():
     cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
     cv2.moveWindow(win, 0, 0)
     cv2.resizeWindow(win, scr_w, scr_h)
+    fullscreen = False
+
+    PROC_SCALE   = 0.5   # detekce probíhá v polovičním rozlišení
+    HAAR_EVERY_N = 3     # Haar kaskáda každý N-tý snímek
 
     with mp_hands.Hands(
         static_image_mode=False,
@@ -460,7 +520,10 @@ def main():
         min_tracking_confidence=0.5,
     ) as face_mesh_model:
 
-        show_text = False  # výchozí stav: texty skryté, O = přepnutí
+        show_text = False
+        frame_idx = 0
+        _last_faces = 0
+        _last_hands = 0
 
         while True:
             ret, frame = cap.read()
@@ -468,14 +531,30 @@ def main():
                 print("[WARNING] Empty frame, skipping.")
                 continue
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mesh_results = face_mesh_model.process(rgb)
+            frame_idx += 1
+            h0, w0 = frame.shape[:2]
 
-            frame, n_faces = detect_face_features(frame, face_cc, mouth_cc, mesh_results, glasses_img, glasses_mask, joint_img, joint_mask, show_text)
-            frame, n_hands = detect_hands(frame, hands_model, show_text)
+            # Zmenšení pro detekci
+            small = cv2.resize(frame, (int(w0 * PROC_SCALE), int(h0 * PROC_SCALE)),
+                               interpolation=cv2.INTER_LINEAR)
+            rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            mesh_results = face_mesh_model.process(rgb_small)
+
+            # Haar jen každý N-tý snímek, jinak přeskoč (EMA udržuje polohu)
+            run_haar = (frame_idx % HAAR_EVERY_N == 0)
+            small, n_faces = detect_face_features(
+                small, face_cc, mouth_cc, mesh_results,
+                glasses_img, glasses_mask, joint_img, joint_mask,
+                show_text, run_haar=run_haar
+            )
+            small, n_hands = detect_hands(small, hands_model, show_text)
+
+            # Výsledek zpět na původní rozlišení
+            frame = cv2.resize(small, (w0, h0), interpolation=cv2.INTER_LINEAR)
+            _last_faces, _last_hands = n_faces, n_hands
 
             if show_text:
-                cv2.putText(frame, f"Faces: {n_faces}  Hands: {n_hands}", (10, 28),
+                cv2.putText(frame, f"Faces: {_last_faces}  Hands: {_last_hands}", (10, 28),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 cv2.putText(frame, "Q = quit  |  O = toggle info", (10, frame.shape[0] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
@@ -495,7 +574,13 @@ def main():
                 break
             if key == ord("o"):
                 show_text = not show_text
-            if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
+            if key == ord("f"):
+                fullscreen = not fullscreen
+                cv2.setWindowProperty(
+                    win, cv2.WND_PROP_FULLSCREEN,
+                    cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL
+                )
+            if frame_idx > 10 and cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
                 break
 
     cap.release()
@@ -503,4 +588,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    log_path = os.path.join(
+        os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)),
+        "facedetector.log"
+    )
+    logging.basicConfig(
+        filename=log_path, filemode="w", level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s %(message)s"
+    )
+    logging.info("Starting FaceDetector")
+    try:
+        main()
+    except Exception:
+        logging.critical("Unhandled exception:\n" + traceback.format_exc())
+        raise
+    logging.info("FaceDetector exited normally")

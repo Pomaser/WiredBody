@@ -1,0 +1,6 @@
+{
+    "camera": {
+        "preferred": 1,
+        "fallback": [0, 2]
+    }
+}
