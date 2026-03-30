@@ -15,6 +15,9 @@
       "Read(//c/Program Files/Anaconda3/**)",
       "Bash(echo \"exit: $?\")",
       "Bash(py --version)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\maj9bj\\OneDrive - Bosch Group\\Projekty\\Python\\WiredBody"
     ]
   }
 }

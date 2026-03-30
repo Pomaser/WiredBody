@@ -33,10 +33,16 @@ import mediapipe as mp
 
 GLASSES_PATH      = resource_path("glasses_single.png")
 JOINT_PATH        = resource_path("joint_single.png")
-FUCK_OFF_SOUND    = resource_path("fuck_off.wav")
-FUCK_OFF_COOLDOWN = 3.0   # sekundy mezi opakovaným přehráním
+FUCK_OFF_SOUND    = resource_path("sounds/fuck_off.wav")
+FUCK_OFF_COOLDOWN = 3.0
+CORNUTO_SOUND     = resource_path("sounds/cornuto.wav")
+CORNUTO_COOLDOWN  = 3.0
+GOOD_BOY_SOUND    = resource_path("sounds/good_boy.wav")
+GOOD_BOY_COOLDOWN = 3.0
 
 _last_fuck_off = 0.0
+_last_cornuto  = 0.0
+_last_good_boy = 0.0
 GLASSES_SCALE    = 0.75   # 1.0 = šířka obličeje
 GLASSES_OFFSET_Y = 0
 GLASSES_SMOOTH   = 0.75
@@ -365,15 +371,51 @@ def detect_face_features(frame, face_cc, mouth_cc, mesh_results=None, glasses_im
 
 def is_fuck_off(lm):
     """Return True when only the middle finger is extended and hand is upright."""
-    # Finger extended = tip.y < pip.y  (y roste dolů)
-    # index=8/6, middle=12/10, ring=16/14, pinky=20/18
     index_up  = lm[8].y  < lm[6].y
     middle_up = lm[12].y < lm[10].y
     ring_up   = lm[16].y < lm[14].y
     pinky_up  = lm[20].y < lm[18].y
-    # Ruka vzpřímená: zápěstí (0) musí být níž než základna prostředníčku (9)
     hand_upright = lm[0].y > lm[9].y
     return middle_up and not index_up and not ring_up and not pinky_up and hand_upright
+
+
+def is_cornuto(lm):
+    """Paroháč: ukazováček a malíček nahoře, prostředníček a prsteníček dole, ruka vzpřímená."""
+    index_up  = lm[8].y  < lm[6].y
+    middle_up = lm[12].y < lm[10].y
+    ring_up   = lm[16].y < lm[14].y
+    pinky_up  = lm[20].y < lm[18].y
+    hand_upright = lm[0].y > lm[9].y
+    return index_up and pinky_up and not middle_up and not ring_up and hand_upright
+
+
+def is_good_boy(lm):
+    """Palec nahoru — rotačně invariantní: směr palce aligned s osou ruky + palec fyzicky vytažen."""
+    def dist(a, b):
+        return math.sqrt((lm[a].x-lm[b].x)**2 + (lm[a].y-lm[b].y)**2)
+
+    def norm(dx, dy):
+        d = math.sqrt(dx*dx + dy*dy) + 1e-6
+        return dx/d, dy/d
+
+    # Osa ruky: zápěstí (0) → MCP prostředníčku (9)
+    hx, hy = norm(lm[9].x - lm[0].x, lm[9].y - lm[0].y)
+    # Směr palce: CMC (1) → špička (4)
+    tx, ty = norm(lm[4].x - lm[1].x, lm[4].y - lm[1].y)
+    thumb_aligned = (tx*hx + ty*hy) > 0.75
+
+    # Palec musí být fyzicky vytažen: špička (4) dál od MCP prostředníčku (9)
+    # než je šířka dlaně (MCP ukazováčku 5 → MCP malíčku 17)
+    palm_width = dist(5, 17)
+    thumb_extended = dist(4, 9) > palm_width * 0.9
+
+    # Prsty skrčeny: špička blíž k zápěstí než PIP
+    def curled(tip, pip):
+        return dist(tip, 0) <= dist(pip, 0) * 1.05
+
+    return (thumb_aligned and thumb_extended
+            and curled(8, 6) and curled(12, 10)
+            and curled(16, 14) and curled(20, 18))
 
 
 def detect_hands(frame, hands_model, show_text=False):
@@ -388,28 +430,55 @@ def detect_hands(frame, hands_model, show_text=False):
             n_hands += 1
             lm = hand_lm.landmark
             fuck_off = is_fuck_off(lm)
+            cornuto  = is_cornuto(lm)
+            good_boy = False  # is_good_boy(lm)
 
             # Draw connections (bones)
-            lm_color = mp_draw.DrawingSpec(
-                color=(0, 0, 255) if fuck_off else LANDMARK_COLOR.color,
-                thickness=2, circle_radius=4
-            )
+            if fuck_off:
+                bone_color = (0, 0, 255)
+            elif cornuto:
+                bone_color = (0, 165, 255)
+            elif good_boy:
+                bone_color = (0, 255, 100)
+            else:
+                bone_color = LANDMARK_COLOR.color
+            lm_color = mp_draw.DrawingSpec(color=bone_color, thickness=2, circle_radius=4)
             mp_draw.draw_landmarks(
                 frame, hand_lm, mp_hands.HAND_CONNECTIONS, lm_color, CONNECTION_COLOR,
             )
 
-            # Gesture label + zvuk
+            now = time.time()
+            wx = int(lm[0].x * w)
+            wy = int(lm[0].y * h)
+
             if fuck_off:
                 if show_text:
-                    wx = int(lm[0].x * w)
-                    wy = int(lm[0].y * h)
                     cv2.putText(frame, "FUCK OFF!", (wx - 40, wy + 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
                 global _last_fuck_off
-                now = time.time()
                 if now - _last_fuck_off >= FUCK_OFF_COOLDOWN:
                     _last_fuck_off = now
                     winsound.PlaySound(FUCK_OFF_SOUND,
+                                       winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+
+            if cornuto:
+                if show_text:
+                    cv2.putText(frame, "CORNUTO!", (wx - 40, wy + 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
+                global _last_cornuto
+                if now - _last_cornuto >= CORNUTO_COOLDOWN:
+                    _last_cornuto = now
+                    winsound.PlaySound(CORNUTO_SOUND,
+                                       winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+
+            if good_boy:
+                if show_text:
+                    cv2.putText(frame, "GOOD BOY!", (wx - 40, wy + 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 100), 3)
+                global _last_good_boy
+                if now - _last_good_boy >= GOOD_BOY_COOLDOWN:
+                    _last_good_boy = now
+                    winsound.PlaySound(GOOD_BOY_SOUND,
                                        winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
 
     return frame, n_hands
@@ -548,6 +617,7 @@ def main():
             if not ret:
                 print("[WARNING] Empty frame, skipping.")
                 continue
+            frame = cv2.flip(frame, 1)
 
             frame_idx += 1
             h0, w0 = frame.shape[:2]

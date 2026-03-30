@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('glasses_single.png', '.'), ('joint_single.png', '.'), ('fuck_off.wav', '.'), ('config.json', '.'), ('C:\\Users\\maj9bj\\AppData\\Roaming\\Python\\Python39\\site-packages\\cv2\\data\\haarcascade_frontalface_default.xml', '.'), ('C:\\Users\\maj9bj\\AppData\\Roaming\\Python\\Python39\\site-packages\\cv2\\data\\haarcascade_smile.xml', '.')]
+datas = [('glasses_single.png', '.'), ('joint_single.png', '.'), ('config.json', '.'), ('sounds', 'sounds'), ('C:\\Users\\maj9bj\\AppData\\Roaming\\Python\\Python39\\site-packages\\cv2\\data\\haarcascade_frontalface_default.xml', '.'), ('C:\\Users\\maj9bj\\AppData\\Roaming\\Python\\Python39\\site-packages\\cv2\\data\\haarcascade_smile.xml', '.')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('mediapipe')
