@@ -307,15 +307,33 @@ def _draw_joint(frame, mesh_results, joint_img, joint_mask):
 
 
 _cached_faces = []
+_no_face_frames = 0
+NO_FACE_HIDE_AFTER = 12   # snímků bez obličeje → skryj brýle/joint
+
+
+def _reset_overlays():
+    """Resetuje EMA stav brýlí a jointu a vymaže smoke."""
+    _g_smooth["gx"] = _g_smooth["gy"] = _g_smooth["angle"] = None
+    _j_smooth["jx"] = _j_smooth["jy"] = None
+    _smoke.clear()
 
 
 def detect_face_features(frame, face_cc, mouth_cc, mesh_results=None, glasses_img=None, glasses_mask=None,
                          joint_img=None, joint_mask=None, show_text=False, run_haar=True):
-    global _cached_faces
+    global _cached_faces, _no_face_frames
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
 
-    # Brýle + joint řídí Face Mesh — nezávislé na Haar
+    # Zjisti, jestli Face Mesh vidí obličej
+    face_visible = bool(mesh_results and mesh_results.multi_face_landmarks)
+    if face_visible:
+        _no_face_frames = 0
+    else:
+        _no_face_frames += 1
+        if _no_face_frames >= NO_FACE_HIDE_AFTER:
+            _reset_overlays()
+
+    # Brýle + joint jen když je obličej viditelný nebo v krátké prodlevě (EMA nenulové)
     _draw_glasses(frame, mesh_results, glasses_img, glasses_mask)
     _draw_joint(frame, mesh_results, joint_img, joint_mask)
 

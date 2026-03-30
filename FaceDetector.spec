@@ -10,7 +10,7 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 a = Analysis(
     ['face_features_detector.py'],
-    pathex=[],
+    pathex=['C:\\Program Files\\Anaconda3\\Library\\bin'],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
